@@ -1,5 +1,5 @@
 # School_Project_2_wheels_banlacing_robot
-I made 2 wheels banlacing robot for my automation class
+I made 2 wheels banlacing robot for my automation class (13,26-41,6-1,11)
 
 I use 2 DC Motor with gearbox, MPU6050 and ESP32 Dev Module  
 I use Pitch Angle of MPU6050 to control the robot angle.  
