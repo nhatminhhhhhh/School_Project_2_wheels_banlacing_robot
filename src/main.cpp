@@ -45,11 +45,22 @@ double deltaTime = 0;
 // PID variables
 float setpoint = 0.9;
 float eprev = 0;
+float derivativeFiltered = 0; // Filtered derivative term
+float derivativeFilterAlpha = 0.3; // Low-pass filter coefficient for derivative (lower = more filtering)
 //PWM limit
 int pwm_MAX = 210;
 int pwm_MIN = 80;
 // EEPROM save flag
 bool savePending = false;
+
+// Manual control variables
+int manualDirection = 0; // 0=stop, 1=forward, 2=backward, 3=left, 4=right
+unsigned long lastManualCmd = 0;
+const unsigned long manualTimeout = 500; // Stop after 500ms if no new command
+
+// Web server timing to avoid conflicts
+unsigned long lastWebHandle = 0;
+const unsigned long webHandleInterval = 10; // Handle web requests every 10ms during balancing
 
 
 // ================== EEPROM Functions ==================
@@ -96,6 +107,13 @@ String getHTML() {
   html += ".btn-update { background: #4CAF50; color: white; }";
   html += ".btn-save { background: #2196F3; color: white; }";
   html += ".btn-load { background: #FF9800; color: white; }";
+  html += ".control-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin: 20px 0; }";
+  html += ".control-btn { padding: 30px; border: none; border-radius: 5px; font-size: 18px; font-weight: bold; cursor: pointer; color: white; }";
+  html += ".btn-forward { background: #4CAF50; grid-column: 2; }";
+  html += ".btn-left { background: #FF9800; grid-column: 1; grid-row: 2; }";
+  html += ".btn-stop { background: #f44336; grid-column: 2; grid-row: 2; }";
+  html += ".btn-right { background: #FF9800; grid-column: 3; grid-row: 2; }";
+  html += ".btn-backward { background: #2196F3; grid-column: 2; grid-row: 3; }";
   html += ".current { background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0; }";
   html += ".current h3 { margin-top: 0; color: #2196F3; }";
   html += ".value { font-size: 18px; color: #333; margin: 5px 0; }";
@@ -153,6 +171,21 @@ String getHTML() {
   html += "<button onclick=\"location.href='/load'\" class='btn btn-load'>Load from EEPROM</button>";
   html += "<button onclick=\"location.reload()\" class='btn' style='background: #607D8B; color: white;'>Refresh</button>";
   
+  // Control buttons
+  html += "<h3 style='margin-top: 30px; text-align: center;'>Robot Control</h3>";
+  html += "<div class='control-grid'>";
+  html += "<button onclick=\"sendControl('forward')\" class='control-btn btn-forward'>&uarr;<br>Forward</button>";
+  html += "<button onclick=\"sendControl('left')\" class='control-btn btn-left'>&larr;<br>Left</button>";
+  html += "<button onclick=\"sendControl('stop')\" class='control-btn btn-stop'>&bull;<br>Stop</button>";
+  html += "<button onclick=\"sendControl('right')\" class='control-btn btn-right'>&rarr;<br>Right</button>";
+  html += "<button onclick=\"sendControl('backward')\" class='control-btn btn-backward'>&darr;<br>Backward</button>";
+  html += "</div>";
+  html += "<script>";
+  html += "function sendControl(cmd) {";
+  html += "  fetch('/control?dir=' + cmd).then(r => console.log('Sent: ' + cmd));";
+  html += "}";
+  html += "</script>";
+  
   html += "</div>";
   html += "<script>setTimeout(function(){ location.reload(); }, 5000);</script>";
   html += "</body></html>";
@@ -197,6 +230,34 @@ void handleLoad() {
   server.send(200, "text/html", response);
 }
 
+void handleControl() {
+  if (server.hasArg("dir")) {
+    String dir = server.arg("dir");
+    lastManualCmd = millis(); // Update timestamp
+    
+    if (dir == "forward") {
+      manualDirection = 1;
+      //Serial.println("Control: Forward");
+    } else if (dir == "backward") {
+      manualDirection = 2;
+      //Serial.println("Control: Backward");
+    } else if (dir == "left") {
+      manualDirection = 3;
+      //Serial.println("Control: Left");
+    } else if (dir == "right") {
+      manualDirection = 4;
+      //Serial.println("Control: Right");
+    } else if (dir == "stop") {
+      manualDirection = 0;
+      //Serial.println("Control: Stop");
+    }
+    
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing direction");
+  }
+}
+
  // ================== Hàm đọc MPU & điều khiển động cơ ==================
 
 void readMPU6050() {
@@ -238,8 +299,14 @@ void readMPU6050() {
   // Serial.print("Filtered: "); Serial.println(filteredAngle);
   
 }
-void set_motor(int dir, int pwr){
+void set_motor(int dir, int pwr, int turnBias = 0){
+  // turnBias: positive = turn right, negative = turn left
+  int pwrLeft = pwr - turnBias;
+  int pwrRight = pwr + turnBias;
   
+  // Constrain individual motor powers
+  pwrLeft = constrain(pwrLeft, 0, 255);
+  pwrRight = constrain(pwrRight, 0, 255);
 
     if (dir) {
         ///forward
@@ -247,47 +314,98 @@ void set_motor(int dir, int pwr){
         digitalWrite(EN_PINA2, true);
         digitalWrite(EN_PINB1, true);
         digitalWrite(EN_PINB2, false);
-        analogWrite(5,pwr);
-        analogWrite(33,pwr);
+        analogWrite(5, pwrLeft);
+        analogWrite(33, pwrRight);
     } else {
         ///backward
         digitalWrite(EN_PINA1, true);
         digitalWrite(EN_PINA2, false);
         digitalWrite(EN_PINB1, false);
         digitalWrite(EN_PINB2, true);
-        int pid = pwr + 10;
-        pid = constrain(pid, 70, 255);
-        analogWrite(5,pid);
-        analogWrite(33,pid);
+        int pidLeft = pwrLeft + 10;
+        int pidRight = pwrRight + 10;
+        pidLeft = constrain(pidLeft, 70, 255);
+        pidRight = constrain(pidRight, 70, 255);
+        analogWrite(5, pidLeft);
+        analogWrite(33, pidRight);
     }  
 }
+
+void updateManualControl(float &targetAngle, int &turnBias) {
+  // Check for timeout
+  if (manualDirection != 0 && (millis() - lastManualCmd > manualTimeout)) {
+    manualDirection = 0; // Auto-stop after timeout
+    Serial.println("Manual control timeout - stopping");
+  }
+  
+  // Adjust target angle and turn bias based on direction
+  switch (manualDirection) {
+    case 0: // Stop
+      targetAngle = 0.9; // Original setpoint
+      turnBias = 0;
+      break;
+    case 1: // Forward - lean forward to move forward
+      targetAngle = -1.0; // Negative angle = lean forward
+      turnBias = 0;
+      break;
+    case 2: // Backward - lean backward to move backward
+      targetAngle = 1.0; // Positive angle = lean backward
+      turnBias = 0;
+      break;
+    case 3: // Left - turn left while balancing
+      targetAngle = 0.9;
+      turnBias = -30; // Negative = left motor slower
+      break;
+    case 4: // Right - turn right while balancing
+      targetAngle = 0.9;
+      turnBias = 30; // Positive = right motor slower
+      break;
+  }
+}
+
 void pid_calculate() {
   if(FailSafe) {
-      set_motor(1, 0); // Stop motors in FailSafe
+      set_motor(1, 0, 0); // Stop motors in FailSafe
       eintegral = 0; // Reset integral
+      derivativeFiltered = 0; // Reset filtered derivative
       Serial.println("FailSafe activated! Motors stopped.");
       return;
   }
+  
+    // Update manual control (adjusts target angle and turn bias)
+    float targetAngle = setpoint;
+    int turnBias = 0;
+    updateManualControl(targetAngle, turnBias);
+    
     // Use the same deltaTime from readMPU6050() instead of separate timing
     float deltaT = deltaTime; // Already calculated in readMPU6050()
     // Inner loop PID for balancing
-    float error = setpoint - filteredAngle;
-    // if((error) > - 3 && (error) < 4 ) {
-    //     error = 0;
-    // }
-    float derivative = Kd * ((error - eprev) / deltaT);
-    derivative = constrain(derivative, -130, 130); // Limit derivative term
+    float error = targetAngle - filteredAngle;
+    
+    // Calculate raw derivative
+    float derivativeRaw = Kd * ((error - eprev) / deltaT);
+    
+    // Apply low-pass filter to derivative term
+    derivativeFiltered = derivativeFilterAlpha * derivativeFiltered + (1.0 - derivativeFilterAlpha) * derivativeRaw;
+    
+    // Constrain the filtered derivative
+    derivativeFiltered = constrain(derivativeFiltered, -130, 130); // Limit derivative term
+    
     eintegral += Ki * error * deltaT;
-    eintegral = constrain(eintegral, -120, 120); // Limit integral term
-
-    float output = (Kp * error) +  eintegral +  derivative; 
+    eintegral = constrain(eintegral, -130, 130); // Limit integral term
+    //   if((error) > - 2.5 && (error) < 2.78 ) {
+    //     error = 0;
+    //     eintegral = 0; // Reset integral when close to setpoint
+    //     derivativeFiltered = 0; // Reset filtered derivative as well
+    // }
+    float output = (Kp * error) +  eintegral +  derivativeFiltered; 
     int dir = (output >= 0) ? 1 : 0;
     int pwr = (int)fabs(output);       
     pwr = constrain(pwr, pwm_MIN, pwm_MAX);      
 
-    //printf("MPU State: %.2f, Error: %.2f, Output: %d, I term: %.2f, D term: %.2f\n", filteredAngle, error, pwr, eintegral, derivative);
+    //printf("MPU State: %.2f, Error: %.2f, Output: %d, I term: %.2f, D term: %.2f\n", filteredAngle, error, pwr, eintegral, derivativeFiltered);
     //printf("DeltaT: %.4f s\n", deltaT);
-    set_motor(dir, pwr);
+    set_motor(dir, pwr, turnBias);
     eprev = error;
     //eprev = corrected_angle_error;
     
@@ -373,6 +491,7 @@ void setup() {
     server.on("/update", handleUpdate);
     server.on("/save", handleSave);
     server.on("/load", handleLoad);
+    server.on("/control", handleControl);
     
     server.begin();
     Serial.println("Web server started!");
@@ -418,7 +537,7 @@ void setup() {
 
 
 void loop() {
-    // Handle web server requests
+    // Handle web server requests (no throttling when not balancing)
     server.handleClient();
     
     // Save parameters when robot is not balancing (to avoid timing disruption)
@@ -428,7 +547,11 @@ void loop() {
     }
     MPU_Setup();
     while(digitalRead(15)== HIGH){
-      server.handleClient(); 
+      // Throttled web handling when waiting
+      if (millis() - lastWebHandle >= webHandleInterval) {
+        server.handleClient();
+        lastWebHandle = millis();
+      }
       readMPU6050();
       eintegral = 0;
       // if(abs(filteredAngle) < 60) {
@@ -442,7 +565,12 @@ void loop() {
     }
   }
       while(digitalRead(15)== LOW){
-        server.handleClient(); // Handle web requests even during balancing
+        // Throttled web handling during balancing - avoid timing conflicts
+        if (millis() - lastWebHandle >= webHandleInterval) {
+          server.handleClient();
+          lastWebHandle = millis();
+        }
+        
         readMPU6050();  
         if(abs(filteredAngle) < 60) {
           FailSafe = false; // Reset FailSafe when within safe angle
