@@ -33,8 +33,8 @@ float eintegral = 0;
 double accelAngle = 0;
 double gyroAngle = 0;
 double filteredAngle = 0;
-double alpha = 0.98; // Complementary filter coefficient (higher = trust gyro more)
-double angleFilterAlpha = 0.3; // Additional low-pass filter for angle (lower = faster response)
+double alpha = 0.98; // Complementary filter coefficient (higher = trust gyro more, heavier filtering) (previously 0.98)
+double angleFilterAlpha = 0.4; // Additional low-pass filter for angle (higher = heavier filtering, smoother) (previously 0.3)
 double prevFilteredAngle = 0;
 
 // Timing variables
@@ -43,10 +43,11 @@ unsigned long lastTime = 0;
 double deltaTime = 0;
 
 // PID variables
-float setpoint = 0.9;
+float setpoint = -9.2; // Target angle (upright)
 float eprev = 0;
 float derivativeFiltered = 0; // Filtered derivative term
 float derivativeFilterAlpha = 0.3; // Low-pass filter coefficient for derivative (lower = more filtering)
+float deadbandZone = 3.0; // Deadband zone in degrees (motor stops if error < this value)
 //PWM limit
 int pwm_MAX = 210;
 int pwm_MIN = 80;
@@ -55,8 +56,10 @@ bool savePending = false;
 
 // Manual control variables
 int manualDirection = 0; // 0=stop, 1=forward, 2=backward, 3=left, 4=right
+int prevManualDirection = 0; // Track previous direction to detect changes
 unsigned long lastManualCmd = 0;
 const unsigned long manualTimeout = 500; // Stop after 500ms if no new command
+float originalKi = 0; // Store original Ki value
 
 // Web server timing to avoid conflicts
 unsigned long lastWebHandle = 0;
@@ -78,9 +81,9 @@ void loadParams() {
   EEPROM.get(2 * sizeof(float), Kd);
 
   // Set defaults if EEPROM is empty (NaN values)
-  if (isnan(Kp)) Kp = 20.0;
-  if (isnan(Ki)) Ki = 0.050;
-  if (isnan(Kd)) Kd = 5.0;
+  if (isnan(Kp)) Kp = 19.0;
+  if (isnan(Ki)) Ki = 35.0;
+  if (isnan(Kd)) Kd = 1.2;
   
   Serial.print("Loaded - Kp: "); Serial.print(Kp);
   Serial.print(", Ki: "); Serial.print(Ki);
@@ -290,7 +293,7 @@ void readMPU6050() {
   prevFilteredAngle = filteredAngle;
   
   // Constrain angle to reasonable limits
-  filteredAngle = constrain(filteredAngle, -60, 60);
+  //filteredAngle = constrain(filteredAngle, -60, 60);
   static double prevAngleForSpeed = 0;
 
   // Debug timing and angles (uncomment if needed)
@@ -314,8 +317,8 @@ void set_motor(int dir, int pwr, int turnBias = 0){
         digitalWrite(EN_PINA2, true);
         digitalWrite(EN_PINB1, true);
         digitalWrite(EN_PINB2, false);
-        analogWrite(5, pwrLeft);
-        analogWrite(33, pwrRight);
+        ledcWrite(0, pwrLeft);   // Channel 0 for pin 5
+        ledcWrite(1, pwrRight);  // Channel 1 for pin 33
     } else {
         ///backward
         digitalWrite(EN_PINA1, true);
@@ -326,8 +329,8 @@ void set_motor(int dir, int pwr, int turnBias = 0){
         int pidRight = pwrRight + 10;
         pidLeft = constrain(pidLeft, 70, 255);
         pidRight = constrain(pidRight, 70, 255);
-        analogWrite(5, pidLeft);
-        analogWrite(33, pidRight);
+        ledcWrite(0, pidLeft);   // Channel 0 for pin 5
+        ledcWrite(1, pidRight);  // Channel 1 for pin 33
     }  
 }
 
@@ -338,26 +341,44 @@ void updateManualControl(float &targetAngle, int &turnBias) {
     Serial.println("Manual control timeout - stopping");
   }
   
+  // Detect direction change and adjust Ki only once
+  if (manualDirection != prevManualDirection) {
+    if (manualDirection == 1 || manualDirection == 2) {
+      // Forward or Backward pressed - decrease Ki by 10 once
+      if (prevManualDirection == 0) {
+        originalKi = Ki; // Store original Ki when first pressing forward/backward
+      }
+      Ki = originalKi - 10;
+      if (Ki < 0) Ki = 0; // Prevent negative Ki
+      Serial.print("Ki decreased to: "); Serial.println(Ki);
+    } else if (manualDirection == 0 && (prevManualDirection == 1 || prevManualDirection == 2)) {
+      // Released forward/backward - restore original Ki
+      Ki = originalKi;
+      Serial.print("Ki restored to: "); Serial.println(Ki);
+    }
+    prevManualDirection = manualDirection; // Update previous direction
+  }
+  
   // Adjust target angle and turn bias based on direction
   switch (manualDirection) {
     case 0: // Stop
-      targetAngle = 0.9; // Original setpoint
+      targetAngle = setpoint; // Original setpoint
       turnBias = 0;
       break;
     case 1: // Forward - lean forward to move forward
-      targetAngle = -1.0; // Negative angle = lean forward
+      targetAngle = setpoint - 0.5; // Negative angle = lean forward
       turnBias = 0;
       break;
     case 2: // Backward - lean backward to move backward
-      targetAngle = 1.0; // Positive angle = lean backward
+      targetAngle = setpoint + 1; // Positive angle = lean backward
       turnBias = 0;
       break;
     case 3: // Left - turn left while balancing
-      targetAngle = 0.9;
+      targetAngle = setpoint;
       turnBias = -30; // Negative = left motor slower
       break;
     case 4: // Right - turn right while balancing
-      targetAngle = 0.9;
+      targetAngle = setpoint;
       turnBias = 30; // Positive = right motor slower
       break;
   }
@@ -389,21 +410,24 @@ void pid_calculate() {
     derivativeFiltered = derivativeFilterAlpha * derivativeFiltered + (1.0 - derivativeFilterAlpha) * derivativeRaw;
     
     // Constrain the filtered derivative
-    derivativeFiltered = constrain(derivativeFiltered, -130, 130); // Limit derivative term
+    derivativeFiltered = constrain(derivativeFiltered, -150, 150); // Limit derivative term
     
     eintegral += Ki * error * deltaT;
     eintegral = constrain(eintegral, -130, 130); // Limit integral term
-    //   if((error) > - 2.5 && (error) < 2.78 ) {
-    //     error = 0;
-    //     eintegral = 0; // Reset integral when close to setpoint
-    //     derivativeFiltered = 0; // Reset filtered derivative as well
-    // }
+    
     float output = (Kp * error) +  eintegral +  derivativeFiltered; 
+    
+    // // Apply deadband zone - stop motors if error is small enough
+    // if (fabs(error) < deadbandZone) {
+    //   output = 0;
+    //   eintegral *= 0.2; // Slowly decay integral in deadband
+    // }
+    
     int dir = (output >= 0) ? 1 : 0;
     int pwr = (int)fabs(output);       
     pwr = constrain(pwr, pwm_MIN, pwm_MAX);      
 
-    //printf("MPU State: %.2f, Error: %.2f, Output: %d, I term: %.2f, D term: %.2f\n", filteredAngle, error, pwr, eintegral, derivativeFiltered);
+    printf("MPU State: %.2f, Error: %.2f, Output: %d, I term: %.2f, D term: %.2f\n", filteredAngle, error, pwr, eintegral, derivativeFiltered);
     //printf("DeltaT: %.4f s\n", deltaT);
     set_motor(dir, pwr, turnBias);
     eprev = error;
@@ -454,18 +478,17 @@ void setup() {
     pinMode(EN_PINA2, OUTPUT);
     pinMode(EN_PINB1, OUTPUT);
     pinMode(EN_PINB2, OUTPUT);
-    pinMode(33,OUTPUT);
     pinMode(2,OUTPUT);// Led 
     digitalWrite(2,LOW);
+    // Configure LEDC for motor PWM - 10kHz frequency, 8-bit resolution
+    ledcSetup(0, 5000, 8);  // Channel 0, 10kHz, 8-bit
+    ledcSetup(1, 5000, 8);  // Channel 1, 10kHz, 8-bit
+    ledcAttachPin(5, 0);     // Pin 5 to channel 0
+    ledcAttachPin(33, 1);    // Pin 33 to channel 1
     set_motor(1, 0);
-    // ledcSetClockSource(LEDC_AUTO_CLK);
-    // ledcAttachChannel(19, 5000, 8, 2); /// cau sau kenh 2
-    // ledcAttachChannel(33, 5000, 8, 0);
-
-  
   Serial.begin(38400); //Initializate Serial wo work well at 8MHz/16MHz
     
-    delay(250);
+  delay(250);
 
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
@@ -545,7 +568,7 @@ void loop() {
         saveParams();
         savePending = false;
     }
-    MPU_Setup();
+    //MPU_Setup();
     while(digitalRead(15)== HIGH){
       // Throttled web handling when waiting
       if (millis() - lastWebHandle >= webHandleInterval) {
@@ -553,6 +576,7 @@ void loop() {
         lastWebHandle = millis();
       }
       readMPU6050();
+      set_motor(1, 0, 0); // Stop motors
       eintegral = 0;
       // if(abs(filteredAngle) < 60) {
       //     FailSafe = false; // Reset FailSafe when within safe angle
@@ -572,11 +596,10 @@ void loop() {
         }
         
         readMPU6050();  
-        if(abs(filteredAngle) < 60) {
+        if(abs(filteredAngle) < 50) {
           FailSafe = false; // Reset FailSafe when within safe angle
         } else FailSafe = true;
         pid_calculate();
     }
     
 }
-
