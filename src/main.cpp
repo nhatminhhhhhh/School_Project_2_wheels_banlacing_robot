@@ -43,11 +43,13 @@ unsigned long lastTime = 0;
 double deltaTime = 0;
 
 // PID variables
-float setpoint = -9.2; // Target angle (upright)
+float output = 0;
+float setpoint = -8.8; // Target angle (upright)
 float eprev = 0;
 float derivativeFiltered = 0; // Filtered derivative term
 float derivativeFilterAlpha = 0.3; // Low-pass filter coefficient for derivative (lower = more filtering)
 float deadbandZone = 3.0; // Deadband zone in degrees (motor stops if error < this value)
+
 //PWM limit
 int pwm_MAX = 210;
 int pwm_MIN = 80;
@@ -261,7 +263,7 @@ void handleControl() {
   }
 }
 
- // ================== Hàm đọc MPU & điều khiển động cơ ==================
+ // ================== FUNCTIONS ==================
 
 void readMPU6050() {
   // Update timing first - use micros() for higher frequency
@@ -294,8 +296,6 @@ void readMPU6050() {
   
   // Constrain angle to reasonable limits
   //filteredAngle = constrain(filteredAngle, -60, 60);
-  static double prevAngleForSpeed = 0;
-
   // Debug timing and angles (uncomment if needed)
   // Serial.print("dt: "); Serial.print(deltaTime*1000); Serial.print("ms, ");
   // Serial.print("Accel: "); Serial.print(accelAngle); Serial.print(", ");
@@ -362,7 +362,8 @@ void updateManualControl(float &targetAngle, int &turnBias) {
   // Adjust target angle and turn bias based on direction
   switch (manualDirection) {
     case 0: // Stop
-      targetAngle = setpoint; // Original setpoint
+      // When no manual command, do not overwrite the passed-in targetAngle
+      // (this preserves adjustments made by caller, e.g. observer/AngleFixRate)
       turnBias = 0;
       break;
     case 1: // Forward - lean forward to move forward
@@ -384,7 +385,7 @@ void updateManualControl(float &targetAngle, int &turnBias) {
   }
 }
 
-void pid_calculate() {
+void pid_calculate(float Target) {
   if(FailSafe) {
       set_motor(1, 0, 0); // Stop motors in FailSafe
       eintegral = 0; // Reset integral
@@ -394,42 +395,43 @@ void pid_calculate() {
   }
   
     // Update manual control (adjusts target angle and turn bias)
-    float targetAngle = setpoint;
     int turnBias = 0;
-    updateManualControl(targetAngle, turnBias);
+    updateManualControl(Target, turnBias);
     
     // Use the same deltaTime from readMPU6050() instead of separate timing
     float deltaT = deltaTime; // Already calculated in readMPU6050()
     // Inner loop PID for balancing
-    float error = targetAngle - filteredAngle;
+    float error = Target - filteredAngle;
     
     // Calculate raw derivative
     float derivativeRaw = Kd * ((error - eprev) / deltaT);
     
     // Apply low-pass filter to derivative term
     derivativeFiltered = derivativeFilterAlpha * derivativeFiltered + (1.0 - derivativeFilterAlpha) * derivativeRaw;
-    
+    // derivativeFiltered = Kd * ((error - eprev) / deltaT);
     // Constrain the filtered derivative
     derivativeFiltered = constrain(derivativeFiltered, -150, 150); // Limit derivative term
     
     eintegral += Ki * error * deltaT;
     eintegral = constrain(eintegral, -130, 130); // Limit integral term
     
-    float output = (Kp * error) +  eintegral +  derivativeFiltered; 
+    output = (Kp * error) +  eintegral +  derivativeFiltered; 
     
-    // // Apply deadband zone - stop motors if error is small enough
+    // Apply deadband zone - stop motors if error is small enough
     // if (fabs(error) < deadbandZone) {
-    //   output = 0;
-    //   eintegral *= 0.2; // Slowly decay integral in deadband
+    //   //output = 0;
+    //   // eintegral *= 0.2; // Slowly decay integral in deadband
+    //   ObserverAngle = 0; // Reset observer angle in deadband
     // }
     
     int dir = (output >= 0) ? 1 : 0;
     int pwr = (int)fabs(output);       
     pwr = constrain(pwr, pwm_MIN, pwm_MAX);      
 
-    printf("MPU State: %.2f, Error: %.2f, Output: %d, I term: %.2f, D term: %.2f\n", filteredAngle, error, pwr, eintegral, derivativeFiltered);
-    //printf("DeltaT: %.4f s\n", deltaT);
+    printf("MPU State: %.2f, Setpoint: %.2f, Error: %.2f, Output: %d, I term: %.2f, D term: %.2f\n", filteredAngle, Target, error, output, eintegral, derivativeFiltered);
+    // printf("DeltaT: %.4f s\n", deltaT);
     set_motor(dir, pwr, turnBias);
+
     eprev = error;
     //eprev = corrected_angle_error;
     
@@ -599,7 +601,16 @@ void loop() {
         if(abs(filteredAngle) < 50) {
           FailSafe = false; // Reset FailSafe when within safe angle
         } else FailSafe = true;
-        pid_calculate();
+
+        float targetAngle = setpoint; // Adjust target by observer angle
+        float AngleFixRate = 10.0;
+        if( filteredAngle < targetAngle){
+          targetAngle += AngleFixRate * deltaTime;
+        } else if( filteredAngle > targetAngle){
+          targetAngle -= AngleFixRate * deltaTime;
+        }
+        pid_calculate(targetAngle);
     }
     
 }
+
